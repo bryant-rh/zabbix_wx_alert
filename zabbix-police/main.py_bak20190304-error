@@ -1,0 +1,155 @@
+#!/usr/bin/env python
+#coding:utf-8
+import MySQLdb
+import redis
+import sys
+from operation import *
+from new_weixin import *
+from config import *
+import datetime,time
+from log import Logger
+import json
+import commands 
+#sendtime=time.strftime("%Y-%m-%d %H:%M:%S",time.localtime(time.time()))
+
+def command(arg1):
+    (status, output) = commands.getstatusoutput(arg1)
+    return status,output
+
+def get_redis(ip,port):
+    try:
+        #连接redis，并读取所有事件id
+        r = redis.StrictRedis(host=ip, port=port)
+        return r.keys()
+    except Exception, e:
+        server_loger.error("Get redis error: %s" %str(e))
+
+
+def delete_redis(ip,port,key):
+    try:
+        #连接redis，并读取所有事件id
+        r = redis.StrictRedis(host=ip, port=port)
+        r.delete(key)
+    except Exception, e:
+        server_loger.error("Delete redis error: %s" %str(e))
+
+#定义通过actionid和subject获取数据库告警具体信息，并以字典形式返回
+def get_mysql(actionid,subject):
+    try:
+        conn=MySQLdb.connect(host=zabbix_db_host, user=zabbix_db_username, passwd=zabbix_db_password, db=zabbix_db_name, port=zabbix_db_port )
+        #host：zabbix数据库ip
+        #user：zabbix数据库用户
+        #passwd：zabbix数据库密码
+        #db：zabbix数据库名称
+        cursor = conn.cursor()
+        cursor.execute("SET NAMES utf8");
+        sql = "SELECT * FROM alerts where actionid = '%s' and subject = '%s' ;" % (actionid,subject)
+        cursor.execute(sql)
+        data = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        event=data[0]
+        messagelist=[]
+        message=event[8]
+        messageone=message.split('#')
+        for i in messageone:
+                messagelist.append(i.split('|'))
+        messagedict=dict(messagelist)
+        return messagedict
+    except MySQLdb.Error,e:
+        server_loger.error("Mysql Error %d: %s" % (e.args[0], e.args[1]))
+
+#查询数据库生成字典
+def analyze_data():
+    subjectlist = get_redis(redis_host, redis_port)
+    originallist=[]
+    for subject in subjectlist:
+        a=get_mysql(str(actionid),subject)
+        originallist.append(a)
+    return originallist
+
+#通过itemid获取图片
+def get_graph_png(itemids):
+    if not os.path.exists(image_path):
+        os.mkdir(image_path)
+    zabbix_url = '%s/index.php' % zabbix_host
+    string = ''
+    for i,value in enumerate(itemids):
+        string+='itemids[%d]=%s&' %(i,value)
+    image_url = '%s/chart.php?period=3600&isNow=1&%s&type=0&profileIdx=web.item.graph&profileIdx2=29123&width=800' %(zabbix_host,string)
+    img_name = '-'.join(itemids)
+    img_name = "%s.png" %img_name
+    #header = {"Content-Type":"application/json"}
+    chrome='Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/50.0.2661.102 Safari/537.36'
+    header = {'User-Agent':chrome}
+    data = {'name': zabbix_username, 'password': zabbix_password, "autologin": 1, "enter": "Sign in"}
+    s = requests.session()
+    req = s.post(zabbix_url, data=data, headers=header)
+    r2 = s.get(image_url)
+    img_path = os.path.join(image_path, img_name)
+    with open(img_path, 'wb') as f:
+        f.write(r2.content)
+        f.close()
+    return img_path
+
+#发送消息
+def send(alert_type):
+    try:
+        originallist = analyze_data()
+        if alert_type == "alert":
+            #告警消息
+            problem = mergeproblem(originallist)
+            content = compress(problem, zabbix_host, alert_type)
+        elif alert_type == "recovery":
+            #恢复消息
+            normal = mergenormal(originallist)
+            content=compress(normal, zabbix_host, alert_type)
+        #获取token
+        token = GetToken(CorpID,Secret)
+        #发送告警消息
+        if len(content) != 0:
+            for i in content:
+                event = i['event']
+                message = i['mes']
+                triggerkey = i['triggerkey']
+                itemvalue = i['itemvalue']
+                #return SendmpnewsMessage(token,Users,Agentid,'告警',Content,Media_id,history_url)
+                #return SendCardMessage(token,Users,Agentid,'告警',Content)
+                #return SendnewsMessage(token,Users,Agentid,'告警',Content,history_url,pic_url)
+                res = SendTextMessage(token,Users,Agentid,message.strip())
+                res_dict = json.loads(res)
+                if res_dict['errcode'] == 0:
+                    if alert_type == 'alert':
+                        server_loger.info('Send Alert message success: event: %s, %s' % (event, res_dict))
+                        if triggerkey == "log[/data/logs/nh_service/national-service-error.log,SystemError,,,skip,,]" or triggerkey == "log[/data/logs/nh_service/national-service-error.log,@nh_service_error,,,skip,,]":
+                            #res = command(""" ansible nh-demo-3.0 -m shell -a ' /usr/bin/python /home/nn_shell/alert_mail/monitor_error.py "%s" """ %itemvalue)
+                            cmd = """ ansible nh-demo-3.0 -m shell -a ' /usr/bin/python /home/nn_shell/alert_mail/monitor_error.py "%s" ' """ %itemvalue
+                            res = command(cmd)
+                            if res[0] == 0:
+                                server_loger.info('Ansible install  success: triggerkey: %s, itmevalue: %s , detail: %s' % (triggerkey, itemvalue, cmd))
+                            else:
+                                server_loger.info('Ansible install  error: triggerkey: %s, itmevalue: %s, error_detail: %s' % (triggerkey, itemvalue, cmd))
+                    else:
+                        server_loger.info('Send Recovery message success: event %s, %s' % (event, res_dict))
+                    for key in event:
+                        delete_redis(redis_host,redis_port,key)
+                        
+                else:
+                    if alert_type == 'alert':
+                        server_loger.error('Send Alert message error: event: %s, %s' % (event, res_dict))
+                    else:
+                        server_loger.error('Send Recovery message error: event: %s,%s' % (event, res_dict))
+
+    except Exception, e:
+        server_loger.error("Send message error: %s" %str(e))
+
+if __name__ == "__main__":
+    if not os.path.exists(log_path):
+        os.mkdir(log_path)
+    log_file = "%s/send_weixin.log" %log_path
+    server_loger = Logger('send_weixin',log_file)
+
+    #发送告警
+    send('alert')
+    #发送恢复
+    send('recovery')
